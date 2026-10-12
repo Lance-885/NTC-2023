@@ -1,0 +1,536 @@
+Option Explicit
+
+Const xlCenter = -4108
+Const xlVCenter = -4160
+Const xlAscending = 1
+Const xlSortNormal = 0
+Const xlYes = 1
+Const xlSortOnValues = 0
+Const xlContinuous = 1
+Const xlThin = 1
+Const xlMedium = -4138
+
+Dim myETABS   As ETABSv1.cOAPI
+Dim SapModel  As ETABSv1.cSapModel
+
+Sub Extract_WallLengths_SumByPier()
+
+    On Error GoTo ErrH
+    
+    Dim wsSum As Worksheet
+    Dim ret As Long
+    
+    Dim NumberNames As Long
+    Dim AreaName() As String
+    Dim Label() As String
+    Dim Story() As String
+    
+    Dim i As Long, row As Long
+    Dim nPoints As Long
+    Dim PointNames() As String
+    Dim j As Long
+    Dim x() As Double, y() As Double, z() As Double
+    Dim L As Double
+    Dim H As Double
+    Dim zMin As Double, zMax As Double
+    Dim pierName As String, SpandrelName As String
+    
+    Dim dictPierData As Object
+    Set dictPierData = CreateObject("Scripting.Dictionary")
+    
+    Dim storyList As Object
+    Set storyList = CreateObject("Scripting.Dictionary")
+    
+    If Not ConnectToETABS() Then
+        MsgBox "No se pudo conectar a ETABS.", vbCritical
+        Exit Sub
+    End If
+    
+    ret = SapModel.AreaObj.GetLabelNameList(NumberNames, AreaName, Label, Story)
+    If ret <> 0 Or NumberNames = 0 Then
+        MsgBox "No se encontraron Area Objects.", vbExclamation
+        GoTo Limpia
+    End If
+    
+    ' PRIMER PASO: Recopilar todos los datos de cada pier
+    For i = 0 To NumberNames - 1
+        
+        pierName = ""
+        SpandrelName = ""
+        
+        ret = SapModel.AreaObj.GetPier(AreaName(i), pierName)
+        ret = SapModel.AreaObj.GetSpandrel(AreaName(i), SpandrelName)
+        
+        If pierName <> "" And pierName <> "None" Then
+            ret = SapModel.AreaObj.GetPoints(AreaName(i), nPoints, PointNames)
+            If ret = 0 And nPoints >= 2 Then
+                
+                ReDim x(0 To nPoints - 1)
+                ReDim y(0 To nPoints - 1)
+                ReDim z(0 To nPoints - 1)
+                
+                For j = 0 To nPoints - 1
+                    ret = SapModel.PointObj.GetCoordCartesian(PointNames(j), x(j), y(j), z(j))
+                Next j
+                
+                L = Sqr((x(1) - x(0)) ^ 2 + (y(1) - y(0)) ^ 2)
+                
+                zMin = z(0)
+                zMax = z(0)
+                For j = 1 To nPoints - 1
+                    If z(j) < zMin Then zMin = z(j)
+                    If z(j) > zMax Then zMax = z(j)
+                Next j
+                
+                Dim keyWithStory As String
+                keyWithStory = pierName & "|" & Story(i)
+                
+                Dim pierInfo As Object
+                If dictPierData.Exists(keyWithStory) Then
+                    Set pierInfo = dictPierData(keyWithStory)
+                Else
+                    Set pierInfo = CreateObject("Scripting.Dictionary")
+                    pierInfo.Add "lengths", CreateObject("Scripting.Dictionary")
+                    pierInfo.Add "zMins", CreateObject("Scripting.Dictionary")
+                    pierInfo.Add "zMaxs", CreateObject("Scripting.Dictionary")
+                    pierInfo.Add "count", 0
+                    dictPierData.Add keyWithStory, pierInfo
+                End If
+                
+                Dim countKey As String
+                countKey = CStr(pierInfo("count"))
+                pierInfo("lengths").Add countKey, L
+                pierInfo("zMins").Add countKey, zMin
+                pierInfo("zMaxs").Add countKey, zMax
+                pierInfo("count") = pierInfo("count") + 1
+                
+                If Not storyList.Exists(Story(i)) Then
+                    storyList.Add Story(i), True
+                End If
+            End If
+        End If
+    Next i
+    
+    Set wsSum = ActiveSheet
+    wsSum.Cells.Clear
+    wsSum.Cells.Font.Name = "Calibri"
+    
+    ' *** ORDENAR STORIES ANTES DE ITERAR ***
+    Dim sortedStories() As String
+    sortedStories = SortStoryNames(storyList)
+    
+    Dim colStart As Long
+    colStart = 1
+    
+    Dim s As Long
+    Dim key As Variant
+    Dim keyParts() As String
+    Dim idx As Long
+    
+    ' SEGUNDO PASO: Procesar y mostrar datos EN ORDEN
+    For s = LBound(sortedStories) To UBound(sortedStories)
+        
+        Dim storyKey As String
+        storyKey = sortedStories(s)
+        
+        ' ========== MUROS X (FILAS 1-52) ==========
+        wsSum.Cells(1, colStart).Value = storyKey & " - Pier (X)"
+        wsSum.Cells(1, colStart + 1).Value = storyKey & " - Long (m)"
+        wsSum.Cells(1, colStart + 2).Value = storyKey & " - Alt (m)"
+        
+        With wsSum.Range(wsSum.Cells(1, colStart), wsSum.Cells(1, colStart + 2))
+            .Interior.Color = RGB(31, 78, 121)
+            .Font.Color = RGB(255, 255, 255)
+            .Font.Bold = True
+            .Font.Name = "Calibri"
+            .HorizontalAlignment = xlCenter
+            .VerticalAlignment = xlVCenter
+        End With
+        
+        Dim storyDataX As Object
+        Set storyDataX = CreateObject("Scripting.Dictionary")
+        
+        For Each key In dictPierData.Keys
+            keyParts = Split(CStr(key), "|")
+            If keyParts(1) = storyKey And Right(keyParts(0), 1) = "X" Then
+                storyDataX.Add keyParts(0), dictPierData(key)
+            End If
+        Next key
+        
+        Dim sortedKeysX As Variant
+        If storyDataX.count > 0 Then
+            sortedKeysX = SortPierNames(storyDataX)
+            
+            Dim rowX As Long
+            rowX = 2
+            For idx = LBound(sortedKeysX) To UBound(sortedKeysX)
+                Dim pierNameX As String
+                pierNameX = sortedKeysX(idx)
+                
+                Dim pierInfo2 As Object
+                Set pierInfo2 = storyDataX(pierNameX)
+                
+                Dim finalLengthX As Double
+                Dim finalHeightX As Double
+                finalLengthX = GetFinalLength(pierInfo2)
+                finalHeightX = GetFinalHeight(pierInfo2)
+                
+                wsSum.Cells(rowX, colStart).Value = pierNameX
+                wsSum.Cells(rowX, colStart + 1).Value = finalLengthX
+                wsSum.Cells(rowX, colStart + 2).Value = finalHeightX
+                
+                rowX = rowX + 1
+            Next idx
+            
+            Dim dataRowX As Long, lastRowX As Long
+            lastRowX = rowX - 1
+            
+            For dataRowX = 2 To lastRowX
+                With wsSum.Range(wsSum.Cells(dataRowX, colStart), wsSum.Cells(dataRowX, colStart + 2))
+                    .Font.Name = "Calibri"
+                    .HorizontalAlignment = xlCenter
+                    .VerticalAlignment = xlVCenter
+                    If dataRowX Mod 2 = 0 Then
+                        .Interior.Color = RGB(217, 225, 242)
+                    Else
+                        .Interior.Color = RGB(255, 255, 255)
+                    End If
+                    .Borders.LineStyle = xlContinuous
+                    .Borders.Color = RGB(0, 0, 0)
+                    .Borders.Weight = xlThin
+                End With
+                wsSum.Cells(dataRowX, colStart + 1).NumberFormat = "0.000"
+                wsSum.Cells(dataRowX, colStart + 2).NumberFormat = "0.000"
+            Next dataRowX
+            
+            With wsSum.Range(wsSum.Cells(1, colStart), wsSum.Cells(1, colStart + 2))
+                .Borders.LineStyle = xlContinuous
+                .Borders.Color = RGB(0, 0, 0)
+                .Borders.Weight = xlMedium
+            End With
+        End If
+        
+        ' ========== MUROS Y (FILAS 53+) ==========
+        wsSum.Cells(53, colStart).Value = storyKey & " - Pier (Y)"
+        wsSum.Cells(53, colStart + 1).Value = storyKey & " - Long (m)"
+        wsSum.Cells(53, colStart + 2).Value = storyKey & " - Alt (m)"
+        
+        With wsSum.Range(wsSum.Cells(53, colStart), wsSum.Cells(53, colStart + 2))
+            .Interior.Color = RGB(31, 78, 121)
+            .Font.Color = RGB(255, 255, 255)
+            .Font.Bold = True
+            .Font.Name = "Calibri"
+            .HorizontalAlignment = xlCenter
+            .VerticalAlignment = xlVCenter
+        End With
+        
+        Dim storyDataY As Object
+        Set storyDataY = CreateObject("Scripting.Dictionary")
+        
+        For Each key In dictPierData.Keys
+            keyParts = Split(CStr(key), "|")
+            If keyParts(1) = storyKey And Right(keyParts(0), 1) = "Y" Then
+                storyDataY.Add keyParts(0), dictPierData(key)
+            End If
+        Next key
+        
+        Dim sortedKeysY As Variant
+        If storyDataY.count > 0 Then
+            sortedKeysY = SortPierNames(storyDataY)
+            
+            Dim rowY As Long
+            rowY = 54
+            For idx = LBound(sortedKeysY) To UBound(sortedKeysY)
+                Dim pierNameY As String
+                pierNameY = sortedKeysY(idx)
+                
+                Dim pierInfo3 As Object
+                Set pierInfo3 = storyDataY(pierNameY)
+                
+                Dim finalLengthY As Double
+                Dim finalHeightY As Double
+                finalLengthY = GetFinalLength(pierInfo3)
+                finalHeightY = GetFinalHeight(pierInfo3)
+                
+                wsSum.Cells(rowY, colStart).Value = pierNameY
+                wsSum.Cells(rowY, colStart + 1).Value = finalLengthY
+                wsSum.Cells(rowY, colStart + 2).Value = finalHeightY
+                
+                rowY = rowY + 1
+            Next idx
+            
+            Dim dataRowY As Long, lastRowY As Long
+            lastRowY = rowY - 1
+            
+            For dataRowY = 54 To lastRowY
+                With wsSum.Range(wsSum.Cells(dataRowY, colStart), wsSum.Cells(dataRowY, colStart + 2))
+                    .Font.Name = "Calibri"
+                    .HorizontalAlignment = xlCenter
+                    .VerticalAlignment = xlVCenter
+                    If dataRowY Mod 2 = 0 Then
+                        .Interior.Color = RGB(217, 225, 242)
+                    Else
+                        .Interior.Color = RGB(255, 255, 255)
+                    End If
+                    .Borders.LineStyle = xlContinuous
+                    .Borders.Color = RGB(0, 0, 0)
+                    .Borders.Weight = xlThin
+                End With
+                wsSum.Cells(dataRowY, colStart + 1).NumberFormat = "0.000"
+                wsSum.Cells(dataRowY, colStart + 2).NumberFormat = "0.000"
+            Next dataRowY
+            
+            With wsSum.Range(wsSum.Cells(53, colStart), wsSum.Cells(53, colStart + 2))
+                .Borders.LineStyle = xlContinuous
+                .Borders.Color = RGB(0, 0, 0)
+                .Borders.Weight = xlMedium
+            End With
+        End If
+        
+        colStart = colStart + 4
+        
+    Next s
+    
+    wsSum.Columns("A:Z").ColumnWidth = 20
+    
+    MsgBox "Proceso completado. Muros X en filas 1-52 | Muros Y en filas 53+", vbInformation
+    
+Limpia:
+    Set SapModel = Nothing
+    Set myETABS = Nothing
+    Exit Sub
+
+ErrH:
+    MsgBox "Error VBA: " & Err.Description, vbCritical
+    Resume Limpia
+End Sub
+
+' ============================================
+' FUNCIÓN: Obtener LONGITUD final
+' ============================================
+Function GetFinalLength(pierInfo As Object) As Double
+    Dim lengths As Object
+    Set lengths = pierInfo("lengths")
+    
+    Dim zMins As Object
+    Set zMins = pierInfo("zMins")
+    
+    Dim count As Long
+    count = pierInfo("count")
+    
+    If count = 1 Then
+        GetFinalLength = lengths("0")
+        Exit Function
+    End If
+    
+    Dim maxZMin As Double
+    maxZMin = zMins("0")
+    
+    Dim i As Long
+    For i = 1 To count - 1
+        If zMins(CStr(i)) > maxZMin Then
+            maxZMin = zMins(CStr(i))
+        End If
+    Next i
+    
+    Dim totalLengthTopLine As Double
+    totalLengthTopLine = 0
+    Dim tolerance As Double
+    tolerance = 0.001
+    
+    For i = 0 To count - 1
+        If Abs(zMins(CStr(i)) - maxZMin) <= tolerance Then
+            totalLengthTopLine = totalLengthTopLine + lengths(CStr(i))
+        End If
+    Next i
+    
+    GetFinalLength = totalLengthTopLine
+End Function
+
+' ============================================
+' FUNCIÓN: Obtener ALTURA total
+' ============================================
+Function GetFinalHeight(pierInfo As Object) As Double
+    Dim zMins As Object
+    Dim zMaxs As Object
+    Set zMins = pierInfo("zMins")
+    Set zMaxs = pierInfo("zMaxs")
+    Dim count As Long
+    count = pierInfo("count")
+    
+    Dim globalZMin As Double
+    Dim globalZMax As Double
+    Dim i As Long
+    
+    globalZMin = zMins("0")
+    globalZMax = zMaxs("0")
+    
+    For i = 1 To count - 1
+        If zMins(CStr(i)) < globalZMin Then globalZMin = zMins(CStr(i))
+        If zMaxs(CStr(i)) > globalZMax Then globalZMax = zMaxs(CStr(i))
+    Next i
+    
+    GetFinalHeight = globalZMax - globalZMin
+End Function
+
+' ============================================
+' FUNCIÓN: Conectar a ETABS
+' ============================================
+Function ConnectToETABS() As Boolean
+    On Error GoTo ErrC
+    
+    Set myETABS = GetObject(, "CSI.ETABS.API.ETABSObject")
+    If myETABS Is Nothing Then GoTo ErrC
+    
+    Set SapModel = myETABS.SapModel
+    If SapModel Is Nothing Then GoTo ErrC
+    
+    ConnectToETABS = True
+    Exit Function
+ErrC:
+    ConnectToETABS = False
+End Function
+
+' ============================================
+' FUNCIÓN: Ordenar Stories por número
+' ============================================
+Function SortStoryNames(storyDict As Object) As String()
+    Dim allKeys() As String
+    Dim i As Long, j As Long
+    Dim key As Variant
+    
+    If storyDict.count = 0 Then
+        ReDim allKeys(0)
+        SortStoryNames = allKeys
+        Exit Function
+    End If
+    
+    ReDim allKeys(0 To storyDict.count - 1)
+    i = 0
+    For Each key In storyDict.Keys
+        allKeys(i) = CStr(key)
+        i = i + 1
+    Next key
+    
+    Dim n As Long, temp As String
+    n = UBound(allKeys) + 1
+    For i = 0 To n - 2
+        For j = 0 To n - 2 - i
+            If ExtractStoryNumber(allKeys(j)) > ExtractStoryNumber(allKeys(j + 1)) Then
+                temp = allKeys(j)
+                allKeys(j) = allKeys(j + 1)
+                allKeys(j + 1) = temp
+            End If
+        Next j
+    Next i
+    SortStoryNames = allKeys
+End Function
+
+' ============================================
+' FUNCIÓN: Extraer número de nombre de story
+' ============================================
+Function ExtractStoryNumber(storyName As String) As Long
+    Dim i As Long
+    Dim numStr As String
+    numStr = ""
+    For i = 1 To Len(storyName)
+        Dim ch As String
+        ch = Mid(storyName, i, 1)
+        If ch >= "0" And ch <= "9" Then
+            numStr = numStr & ch
+        End If
+    Next i
+    If numStr <> "" Then
+        ExtractStoryNumber = CLng(numStr)
+    Else
+        ExtractStoryNumber = 0
+    End If
+End Function
+
+' ============================================
+' FUNCIÓN: Ordenar Pier Names
+' ============================================
+Function SortPierNames(pierDict As Object) As String()
+    Dim allKeys() As String
+    Dim i As Long
+    Dim key As Variant
+    
+    If pierDict.count = 0 Then
+        ReDim allKeys(0)
+        SortPierNames = allKeys
+        Exit Function
+    End If
+    
+    ReDim allKeys(0 To pierDict.count - 1)
+    i = 0
+    For Each key In pierDict.Keys
+        allKeys(i) = CStr(key)
+        i = i + 1
+    Next key
+    
+    Dim j As Long, temp As String, n As Long
+    n = UBound(allKeys) + 1
+    For i = 0 To n - 2
+        For j = 0 To n - 2 - i
+            If CompareCustom(allKeys(j), allKeys(j + 1)) > 0 Then
+                temp = allKeys(j)
+                allKeys(j) = allKeys(j + 1)
+                allKeys(j + 1) = temp
+            End If
+        Next j
+    Next i
+    SortPierNames = allKeys
+End Function
+
+' ============================================
+' FUNCIÓN: Comparar Pier Names
+' ============================================
+Function CompareCustom(str1 As String, str2 As String) As Long
+    Dim prefix1 As String, num1 As Long, suffix1 As String
+    Dim prefix2 As String, num2 As Long, suffix2 As String
+    ExtractPierComponents str1, prefix1, num1, suffix1
+    ExtractPierComponents str2, prefix2, num2, suffix2
+    If suffix1 < suffix2 Then
+        CompareCustom = -1
+        Exit Function
+    ElseIf suffix1 > suffix2 Then
+        CompareCustom = 1
+        Exit Function
+    End If
+    If num1 < num2 Then
+        CompareCustom = -1
+    ElseIf num1 > num2 Then
+        CompareCustom = 1
+    Else
+        CompareCustom = 0
+    End If
+End Function
+
+' ============================================
+' FUNCIÓN: Descomponer nombre de Pier
+' ============================================
+Sub ExtractPierComponents(pierName As String, prefix As String, num As Long, suffix As String)
+    Dim i As Long
+    Dim numStr As String
+    Dim numFound As Boolean
+    prefix = ""
+    numStr = ""
+    suffix = ""
+    num = 0
+    numFound = False
+    For i = 1 To Len(pierName)
+        Dim ch As String
+        ch = Mid(pierName, i, 1)
+        If ch >= "0" And ch <= "9" Then
+            numFound = True
+            numStr = numStr & ch
+        ElseIf (ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z") Then
+            If Not numFound Then
+                prefix = prefix & ch
+            Else
+                suffix = suffix & ch
+            End If
+        End If
+    Next i
+    If numStr <> "" Then num = CLng(numStr)
+End Sub

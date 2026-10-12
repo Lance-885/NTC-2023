@@ -1,0 +1,651 @@
+Option Explicit
+
+' ============================================================
+'  MACRO: Pier Labels con consolidacion NTC Mamposteria 2023
+'  ORDEN: Izquierda a derecha, abajo hacia arriba, desde origen
+'
+'  - Solo muros PISO A TECHO
+'  - Excluye antepechos / dinteles (filtro de hueco)
+'  - Excluye secciones que contengan "CASTILLO" en el nombre
+'  - Muros de diferente seccion/material => pier separado SIEMPRE
+'  - Muros adyacentes mismo material, gap <= MAX_GAP se consolidan
+'  - Longitud maxima consolidada: MAX_LONG_MURO (NTC 4m)
+'  - Muros inclinados: |dx| >= |dy| => X   |dy| > |dx| => Y
+'  - Numeracion M1X, M2X / M1Y, M2Y
+'
+'  NIVELES DESFASADOS:
+'  - Un muro partido en varios stories CONSERVA su nombre mientras
+'    NO exista una losa en la base del tramo. Si hay losa apoyando
+'    en esa cota => empieza un pier nuevo (nuevo entrepiso real).
+'  - Tolerancia vertical limitada al 25% de la altura del story
+'    (evita que un tramo de 10 cm se cuele en el story vecino)
+'  - Un nombre nunca se repite para dos piers en el mismo story
+'
+'  REQUIERE: Referencia ETABSv1 en Herramientas > Referencias
+'  UNIDADES: longitudes en m (unidades presentes del modelo)
+' ============================================================
+
+Const MAX_LONG_MURO    As Double = 4#
+Const MAX_GAP_CASTILLO As Double = 0.35
+Const SOLAPE_MIN_REL   As Double = 0.5    ' solape minimo en planta para continuar nombre
+Const OFFSET_LOSA      As Double = 0.25   ' m, distancia al eje del muro para buscar losa
+Const ROMPER_EN_LOSA_DE_BORDE As Boolean = True
+'   True  = basta losa a UN lado del muro para iniciar pier nuevo
+'   False = se requiere losa a AMBOS lados (muro interior)
+Const MAX_PIERS        As Long = 2000
+
+Sub NombrarPier_Consolidado()
+
+    On Error GoTo ErrHandler
+
+    Dim myHelper      As ETABSv1.cHelper
+    Dim myETABSObject As ETABSv1.cOAPI
+    Dim mySapModel    As ETABSv1.cSapModel
+
+    Set myHelper = New ETABSv1.Helper
+    Set myETABSObject = myHelper.GetObject("CSI.ETABS.API.ETABSObject")
+    Set mySapModel = myETABSObject.SapModel
+
+    Dim ret As Long
+
+    Dim tolZ  As Double: tolZ = 0.15
+    Dim tolXY As Double: tolXY = 0.2
+    Dim tolL  As Double: tolL = 0.05
+    Dim tolZv As Double
+
+    ' ===========================================================
+    '  1. NIVELES
+    ' ===========================================================
+    Dim nStories  As Long
+    Dim sNames()  As String
+    Dim sElev()   As Double
+    Dim sHgt()    As Double
+    Dim sMaster() As Boolean
+    Dim sSimTo()  As String
+    Dim sSplcAb() As Boolean
+    Dim sSplcHt() As Double
+
+    ret = mySapModel.Story.GetStories(nStories, sNames, sElev, sHgt, _
+                                      sMaster, sSimTo, sSplcAb, sSplcHt)
+    If ret <> 0 Then
+        MsgBox "Error GetStories. ret=" & ret, vbCritical
+        Exit Sub
+    End If
+
+    Dim nElev As Long: nElev = nStories + 1
+    Dim elevs() As Double
+    ReDim elevs(0 To nElev - 1)
+
+    Dim iii As Long
+    For iii = 0 To nElev - 1
+        elevs(iii) = sElev(iii)
+    Next iii
+
+    Dim si As Long, sj As Long, tmpE As Double
+    For si = 0 To nElev - 2
+        For sj = 0 To nElev - si - 2
+            If elevs(sj) > elevs(sj + 1) Then
+                tmpE = elevs(sj)
+                elevs(sj) = elevs(sj + 1)
+                elevs(sj + 1) = tmpE
+            End If
+        Next sj
+    Next si
+
+    ' ===========================================================
+    '  2. AREAS
+    ' ===========================================================
+    Dim nAreas   As Long
+    Dim aNames() As String
+
+    ret = mySapModel.AreaObj.GetNameList(nAreas, aNames)
+    If ret <> 0 Or nAreas = 0 Then
+        MsgBox "Error GetNameList. ret=" & ret, vbCritical
+        Exit Sub
+    End If
+
+    Dim dictIdx As Object: Set dictIdx = CreateObject("Scripting.Dictionary")
+    Dim ia As Long
+    For ia = 0 To nAreas - 1
+        If Not dictIdx.Exists(aNames(ia)) Then dictIdx.Add aNames(ia), ia
+    Next ia
+
+    ' ===========================================================
+    '  3. PRECALCULAR GEOMETRIA (MUROS Y LOSAS)
+    ' ===========================================================
+    Dim i As Long, j As Long, nPts As Long
+    Dim Pts() As String
+    Dim xA() As Double, yA() As Double, zA() As Double
+
+    Dim aXMn()  As Double, aXMx()  As Double
+    Dim aYMn()  As Double, aYMx()  As Double
+    Dim aZMn()  As Double, aZMx()  As Double
+    Dim aEje()  As String
+    Dim aOk()   As Boolean
+    Dim aProp() As String
+
+    ReDim aXMn(0 To nAreas - 1): ReDim aXMx(0 To nAreas - 1)
+    ReDim aYMn(0 To nAreas - 1): ReDim aYMx(0 To nAreas - 1)
+    ReDim aZMn(0 To nAreas - 1): ReDim aZMx(0 To nAreas - 1)
+    ReDim aEje(0 To nAreas - 1): ReDim aOk(0 To nAreas - 1)
+    ReDim aProp(0 To nAreas - 1)
+
+    ' Losas horizontales
+    Dim nF As Long: nF = 0
+    Dim fZ() As Double, fXs() As Variant, fYs() As Variant
+    Dim fXMn() As Double, fXMx() As Double, fYMn() As Double, fYMx() As Double
+    ReDim fZ(0 To nAreas - 1): ReDim fXs(0 To nAreas - 1): ReDim fYs(0 To nAreas - 1)
+    ReDim fXMn(0 To nAreas - 1): ReDim fXMx(0 To nAreas - 1)
+    ReDim fYMn(0 To nAreas - 1): ReDim fYMx(0 To nAreas - 1)
+
+    Dim xMnT As Double, xMxT As Double
+    Dim yMnT As Double, yMxT As Double
+    Dim zMnT As Double, zMxT As Double
+    Dim dxPl As Double, dyPl As Double, dzPn As Double
+    Dim Lmx  As Double, dxD As Double, dyD As Double
+    Dim jj   As Long, ddx As Double, ddy As Double, LL As Double
+    Dim sProp As String
+
+    For i = 0 To nAreas - 1
+
+        aOk(i) = False
+        aProp(i) = ""
+
+        sProp = ""
+        ret = mySapModel.AreaObj.GetProperty(aNames(i), sProp)
+        If ret <> 0 Then sProp = "UNKNOWN"
+        aProp(i) = sProp
+
+        If InStr(1, UCase(sProp), "CASTILLO") > 0 Then GoTo SigPre
+        ' Excluir bovedas (shells inclinados que no son muro ni losa)
+        If InStr(1, UCase(sProp), "BOVEDA") > 0 Then GoTo SigPre
+        ' Excluir trabes de desnivel modeladas como shell (se disenan como spandrel)
+        If InStr(1, UCase(sProp), "TRABE") > 0 Then GoTo SigPre
+
+        ret = mySapModel.AreaObj.GetPoints(aNames(i), nPts, Pts)
+        If ret <> 0 Or nPts < 3 Then GoTo SigPre
+
+        ReDim xA(0 To nPts - 1)
+        ReDim yA(0 To nPts - 1)
+        ReDim zA(0 To nPts - 1)
+
+        For j = 0 To nPts - 1
+            ret = mySapModel.PointObj.GetCoordCartesian(Pts(j), xA(j), yA(j), zA(j))
+            If ret <> 0 Then GoTo SigPre
+        Next j
+
+        xMnT = xA(0): xMxT = xA(0)
+        yMnT = yA(0): yMxT = yA(0)
+        zMnT = zA(0): zMxT = zA(0)
+
+        For j = 1 To nPts - 1
+            If xA(j) < xMnT Then xMnT = xA(j)
+            If xA(j) > xMxT Then xMxT = xA(j)
+            If yA(j) < yMnT Then yMnT = yA(j)
+            If yA(j) > yMxT Then yMxT = yA(j)
+            If zA(j) < zMnT Then zMnT = zA(j)
+            If zA(j) > zMxT Then zMxT = zA(j)
+        Next j
+
+        dxPl = xMxT - xMnT
+        dyPl = yMxT - yMnT
+        dzPn = zMxT - zMnT
+
+        ' --- Losa horizontal: guardar poligono para deteccion de apoyo
+        If dzPn < tolL Then
+            If dxPl >= tolL And dyPl >= tolL Then
+                fZ(nF) = (zMnT + zMxT) / 2
+                fXs(nF) = xA
+                fYs(nF) = yA
+                fXMn(nF) = xMnT: fXMx(nF) = xMxT
+                fYMn(nF) = yMnT: fYMx(nF) = yMxT
+                nF = nF + 1
+            End If
+            GoTo SigPre
+        End If
+
+        If dxPl < tolL And dyPl < tolL Then GoTo SigPre
+
+        Lmx = -1: dxD = 0: dyD = 0
+        For j = 0 To nPts - 1
+            jj = (j + 1) Mod nPts
+            ddx = xA(jj) - xA(j)
+            ddy = yA(jj) - yA(j)
+            LL = Sqr(ddx * ddx + ddy * ddy)
+            If LL > Lmx Then Lmx = LL: dxD = ddx: dyD = ddy
+        Next j
+
+        If Lmx < tolL Then GoTo SigPre
+
+        aXMn(i) = xMnT: aXMx(i) = xMxT
+        aYMn(i) = yMnT: aYMx(i) = yMxT
+        aZMn(i) = zMnT: aZMx(i) = zMxT
+
+        If Abs(dxD) >= Abs(dyD) Then
+            aEje(i) = "X"
+        Else
+            aEje(i) = "Y"
+        End If
+
+        aOk(i) = True
+
+SigPre:
+    Next i
+
+    ' ===========================================================
+    '  4. PROCESAR ENTREPISO POR ENTREPISO
+    ' ===========================================================
+    Dim s As Long, zBase As Double, zTop As Double, hNiv As Double
+    Dim dictN As Object, kgN As String, regN As String, ejeI As String
+    Dim cNN As Collection, cGN As Collection
+    Dim zGMn As Double, zGMx As Double, sumH As Double, zL As Double, zH As Double
+    Dim k As Long, ppN() As String, kvN As Variant
+    Dim totX As Long, totY As Long, cntX As Long, cntY As Long
+    Dim totCont As Long
+    totX = 0: totY = 0: totCont = 0
+
+    Dim gEje()   As String
+    Dim gAxis()  As Double
+    Dim gStart() As Double
+    Dim gEnd()   As Double
+    Dim gAreas() As String
+    Dim gProp()  As String
+    Dim nValid   As Long
+
+    ReDim gEje(0 To MAX_PIERS - 1)
+    ReDim gAxis(0 To MAX_PIERS - 1)
+    ReDim gStart(0 To MAX_PIERS - 1)
+    ReDim gEnd(0 To MAX_PIERS - 1)
+    ReDim gAreas(0 To MAX_PIERS - 1)
+    ReDim gProp(0 To MAX_PIERS - 1)
+
+    ' piers consolidados del story actual
+    Dim cEje() As String, cAxis() As Double, cStart() As Double, cEnd() As Double
+    Dim cAreas() As String, cProp() As String, cName() As String
+    Dim nCh As Long
+    ReDim cEje(0 To MAX_PIERS - 1): ReDim cAxis(0 To MAX_PIERS - 1)
+    ReDim cStart(0 To MAX_PIERS - 1): ReDim cEnd(0 To MAX_PIERS - 1)
+    ReDim cAreas(0 To MAX_PIERS - 1): ReDim cProp(0 To MAX_PIERS - 1)
+    ReDim cName(0 To MAX_PIERS - 1)
+
+    ' piers del story inferior
+    Dim pEje() As String, pAxis() As Double, pStart() As Double, pEnd() As Double
+    Dim pProp() As String, pName() As String
+    Dim nPrev As Long, prevZTop As Double
+    ReDim pEje(0 To MAX_PIERS - 1): ReDim pAxis(0 To MAX_PIERS - 1)
+    ReDim pStart(0 To MAX_PIERS - 1): ReDim pEnd(0 To MAX_PIERS - 1)
+    ReDim pProp(0 To MAX_PIERS - 1): ReDim pName(0 To MAX_PIERS - 1)
+    nPrev = 0: prevZTop = -1E+20
+
+    For s = 0 To nElev - 2
+
+        zBase = elevs(s)
+        zTop = elevs(s + 1)
+        hNiv = zTop - zBase
+        If hNiv < tolL Then GoTo SigNivel
+
+        tolZv = tolZ
+        If tolZv > 0.25 * hNiv Then tolZv = 0.25 * hNiv
+
+        Set dictN = CreateObject("Scripting.Dictionary")
+
+        For i = 0 To nAreas - 1
+            If Not aOk(i) Then GoTo SigAN
+            If aZMn(i) < zBase - tolZv Then GoTo SigAN
+            If aZMx(i) > zTop + tolZv Then GoTo SigAN
+            If (aZMx(i) - aZMn(i)) < tolL Then GoTo SigAN
+
+            ejeI = aEje(i)
+
+            If ejeI = "X" Then
+                kgN = "X|" & aProp(i) & "|" & _
+                      CLng(Round(((aYMn(i) + aYMx(i)) / 2) / tolXY, 0)) & _
+                      "|" & CLng(Round(aXMn(i) / tolXY, 0)) & _
+                      "|" & CLng(Round(aXMx(i) / tolXY, 0))
+            Else
+                kgN = "Y|" & aProp(i) & "|" & _
+                      CLng(Round(((aXMn(i) + aXMx(i)) / 2) / tolXY, 0)) & _
+                      "|" & CLng(Round(aYMn(i) / tolXY, 0)) & _
+                      "|" & CLng(Round(aYMx(i) / tolXY, 0))
+            End If
+
+            regN = aNames(i) & "|" & CStr(aZMn(i)) & "|" & CStr(aZMx(i)) & "|" & ejeI
+
+            If Not dictN.Exists(kgN) Then
+                Set cNN = New Collection
+                cNN.Add regN
+                dictN.Add kgN, cNN
+            Else
+                dictN(kgN).Add regN
+            End If
+SigAN:
+        Next i
+
+        nValid = 0
+
+        For Each kvN In dictN.Keys
+            Set cGN = dictN(kvN)
+            zGMn = 1E+20: zGMx = -1E+20: sumH = 0
+
+            For k = 1 To cGN.count
+                ppN = Split(cGN(k), "|")
+                zL = CDbl(ppN(1)): zH = CDbl(ppN(2))
+                If zL < zGMn Then zGMn = zL
+                If zH > zGMx Then zGMx = zH
+                sumH = sumH + (zH - zL)
+            Next k
+
+            If Abs(zGMn - zBase) > tolZv Then GoTo SigGN
+            If Abs(zGMx - zTop) > tolZv Then GoTo SigGN
+            If sumH < hNiv - tolZv Then GoTo SigGN
+
+            Dim gxMn As Double, gxMx As Double
+            Dim gyMn As Double, gyMx As Double
+            gxMn = 1E+20: gxMx = -1E+20
+            gyMn = 1E+20: gyMx = -1E+20
+            Dim arLst As String: arLst = ""
+
+            For k = 1 To cGN.count
+                ppN = Split(cGN(k), "|")
+                Dim aNmG As String: aNmG = ppN(0)
+                Dim idxA As Long: idxA = dictIdx(aNmG)
+                If aXMn(idxA) < gxMn Then gxMn = aXMn(idxA)
+                If aXMx(idxA) > gxMx Then gxMx = aXMx(idxA)
+                If aYMn(idxA) < gyMn Then gyMn = aYMn(idxA)
+                If aYMx(idxA) > gyMx Then gyMx = aYMx(idxA)
+                If Len(arLst) > 0 Then arLst = arLst & ","
+                arLst = arLst & aNmG
+            Next k
+
+            Dim gpEje As String: gpEje = Left(CStr(kvN), 1)
+
+            If gpEje = "X" Then
+                gAxis(nValid) = (gyMn + gyMx) / 2
+                gStart(nValid) = gxMn
+                gEnd(nValid) = gxMx
+            Else
+                gAxis(nValid) = (gxMn + gxMx) / 2
+                gStart(nValid) = gyMn
+                gEnd(nValid) = gyMx
+            End If
+
+            gEje(nValid) = gpEje
+            gAreas(nValid) = arLst
+            gProp(nValid) = Split(CStr(kvN), "|")(1)
+            nValid = nValid + 1
+SigGN:
+        Next kvN
+
+        If nValid = 0 Then
+            nPrev = 0
+            GoTo SigNivel
+        End If
+
+        ' Ordenar: izquierda a derecha, abajo a arriba
+        Dim vi As Long, vj As Long
+        Dim tmpEje As String, tmpAxis As Double, tmpStart As Double
+        Dim tmpEnd As Double, tmpAr As String, tmpProp As String
+        Dim skA As String, skB As String
+
+        For vi = 0 To nValid - 2
+            For vj = 0 To nValid - vi - 2
+
+                skA = gEje(vj) & _
+                      Format(gAxis(vj) + 100000, "0000000.0000") & _
+                      Format(gStart(vj) + 100000, "0000000.0000")
+
+                skB = gEje(vj + 1) & _
+                      Format(gAxis(vj + 1) + 100000, "0000000.0000") & _
+                      Format(gStart(vj + 1) + 100000, "0000000.0000")
+
+                If skA > skB Then
+                    tmpEje = gEje(vj): gEje(vj) = gEje(vj + 1): gEje(vj + 1) = tmpEje
+                    tmpAxis = gAxis(vj): gAxis(vj) = gAxis(vj + 1): gAxis(vj + 1) = tmpAxis
+                    tmpStart = gStart(vj): gStart(vj) = gStart(vj + 1): gStart(vj + 1) = tmpStart
+                    tmpEnd = gEnd(vj): gEnd(vj) = gEnd(vj + 1): gEnd(vj + 1) = tmpEnd
+                    tmpAr = gAreas(vj): gAreas(vj) = gAreas(vj + 1): gAreas(vj + 1) = tmpAr
+                    tmpProp = gProp(vj): gProp(vj) = gProp(vj + 1): gProp(vj + 1) = tmpProp
+                End If
+
+            Next vj
+        Next vi
+
+        ' Consolidar muros adyacentes (logica NTC 4m)
+        nCh = 0
+
+        Dim chainEje   As String
+        Dim chainAxis  As Double
+        Dim chainStart As Double
+        Dim chainEnd   As Double
+        Dim chainAreas As String
+        Dim chainProp  As String
+        Dim inChain    As Boolean: inChain = False
+
+        For vi = 0 To nValid - 1
+
+            Dim curEje   As String: curEje = gEje(vi)
+            Dim curAxis  As Double: curAxis = gAxis(vi)
+            Dim curStart As Double: curStart = gStart(vi)
+            Dim curEnd   As Double: curEnd = gEnd(vi)
+            Dim curAreas As String: curAreas = gAreas(vi)
+            Dim curProp  As String: curProp = gProp(vi)
+
+            Dim canMerge As Boolean: canMerge = False
+
+            If inChain Then
+                If curEje = chainEje And curProp = chainProp Then
+                    If Abs(curAxis - chainAxis) <= tolXY Then
+                        Dim gap    As Double: gap = curStart - chainEnd
+                        Dim newLen As Double: newLen = curEnd - chainStart
+                        If gap >= -tolZ And gap <= MAX_GAP_CASTILLO Then
+                            If newLen <= MAX_LONG_MURO + tolZ Then
+                                canMerge = True
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+
+            If canMerge Then
+                If curEnd > chainEnd Then chainEnd = curEnd
+                chainAreas = chainAreas & "," & curAreas
+            Else
+                If inChain Then
+                    cEje(nCh) = chainEje: cAxis(nCh) = chainAxis
+                    cStart(nCh) = chainStart: cEnd(nCh) = chainEnd
+                    cAreas(nCh) = chainAreas: cProp(nCh) = chainProp
+                    nCh = nCh + 1
+                End If
+                chainEje = curEje
+                chainAxis = curAxis
+                chainStart = curStart
+                chainEnd = curEnd
+                chainAreas = curAreas
+                chainProp = curProp
+                inChain = True
+            End If
+
+        Next vi
+
+        If inChain Then
+            cEje(nCh) = chainEje: cAxis(nCh) = chainAxis
+            cStart(nCh) = chainStart: cEnd(nCh) = chainEnd
+            cAreas(nCh) = chainAreas: cProp(nCh) = chainProp
+            nCh = nCh + 1
+        End If
+
+        ' -------------------------------------------------------
+        '  NOMBRES: continuar el del story inferior si NO hay losa
+        '  apoyando en la base de este tramo
+        ' -------------------------------------------------------
+        Dim usados As Object: Set usados = CreateObject("Scripting.Dictionary")
+        Dim ci As Long, pk As Long, best As Long
+        Dim ov As Double, lMin As Double, bestOv As Double
+        Dim contiguo As Boolean
+
+        contiguo = (nPrev > 0 And Abs(prevZTop - zBase) <= 0.01)
+
+        For ci = 0 To nCh - 1
+            cName(ci) = ""
+
+            If contiguo Then
+                If Not HayLosa(zBase, tolZv, cEje(ci), cAxis(ci), cStart(ci), cEnd(ci), _
+                               fZ, fXs, fYs, fXMn, fXMx, fYMn, fYMx, nF) Then
+                    best = -1: bestOv = 0
+                    For pk = 0 To nPrev - 1
+                        If pEje(pk) = cEje(ci) And pProp(pk) = cProp(ci) Then
+                        If Abs(pAxis(pk) - cAxis(ci)) <= tolXY Then
+                        If Not usados.Exists(pName(pk)) Then
+                            ov = MinD(pEnd(pk), cEnd(ci)) - MaxD(pStart(pk), cStart(ci))
+                            lMin = MinD(pEnd(pk) - pStart(pk), cEnd(ci) - cStart(ci))
+                            If ov >= SOLAPE_MIN_REL * lMin And ov > bestOv Then
+                                best = pk: bestOv = ov
+                            End If
+                        End If
+                        End If
+                        End If
+                    Next pk
+
+                    If best >= 0 Then
+                        cName(ci) = pName(best)
+                        usados.Add cName(ci), True
+                        totCont = totCont + 1
+                    End If
+                End If
+            End If
+        Next ci
+
+        ' Nombres nuevos (sin repetir en el story)
+        cntX = 0: cntY = 0
+        Dim pNm As String
+        For ci = 0 To nCh - 1
+            If cName(ci) = "" Then
+                Do
+                    If cEje(ci) = "X" Then
+                        cntX = cntX + 1: pNm = "M" & cntX & "X"
+                    Else
+                        cntY = cntY + 1: pNm = "M" & cntY & "Y"
+                    End If
+                Loop While usados.Exists(pNm)
+                cName(ci) = pNm
+                usados.Add pNm, True
+                If cEje(ci) = "X" Then totX = totX + 1 Else totY = totY + 1
+            End If
+
+            Call AsignarPierLabel(mySapModel, cName(ci), cAreas(ci), ret)
+        Next ci
+
+        For ci = 0 To nCh - 1
+            pEje(ci) = cEje(ci): pAxis(ci) = cAxis(ci)
+            pStart(ci) = cStart(ci): pEnd(ci) = cEnd(ci)
+            pProp(ci) = cProp(ci): pName(ci) = cName(ci)
+        Next ci
+        nPrev = nCh
+        prevZTop = zTop
+
+SigNivel:
+    Next s
+
+    mySapModel.View.RefreshView 0, False
+
+    MsgBox "Pier labels asignados." & vbCrLf & vbCrLf & _
+           "Losas detectadas  =>  " & nF & vbCrLf & _
+           "Piers nuevos en X  =>  " & totX & vbCrLf & _
+           "Piers nuevos en Y  =>  " & totY & vbCrLf & _
+           "Tramos que continuaron nombre (sin losa en su base)  =>  " & totCont, vbInformation
+
+    Exit Sub
+
+ErrHandler:
+    MsgBox "Error: " & Err.Number & " - " & Err.Description, vbCritical
+
+End Sub
+
+' ===========================================================
+'  Hay losa en la cota zLev apoyando sobre la linea del muro?
+'  Se revisan puntos al 25/50/75% del muro, desplazados
+'  OFFSET_LOSA a cada lado del eje del muro.
+' ===========================================================
+Private Function HayLosa(ByVal zLev As Double, ByVal tolZv As Double, _
+                         ByVal eje As String, ByVal axis As Double, _
+                         ByVal st As Double, ByVal en As Double, _
+                         ByRef fZ() As Double, ByRef fXs() As Variant, ByRef fYs() As Variant, _
+                         ByRef fXMn() As Double, ByRef fXMx() As Double, _
+                         ByRef fYMn() As Double, ByRef fYMx() As Double, _
+                         ByVal nF As Long) As Boolean
+
+    Dim hitL As Boolean, hitR As Boolean
+    Dim f As Long, lado As Long
+    Dim frac As Variant, along As Double, px As Double, py As Double
+
+    For f = 0 To nF - 1
+        If Abs(fZ(f) - zLev) <= tolZv Then
+            For Each frac In Array(0.25, 0.5, 0.75)
+                along = st + frac * (en - st)
+                For lado = -1 To 1 Step 2
+                    If eje = "X" Then
+                        px = along: py = axis + lado * OFFSET_LOSA
+                    Else
+                        px = axis + lado * OFFSET_LOSA: py = along
+                    End If
+                    If px >= fXMn(f) And px <= fXMx(f) And py >= fYMn(f) And py <= fYMx(f) Then
+                        If PuntoEnPoligono(px, py, fXs(f), fYs(f)) Then
+                            If lado = -1 Then hitL = True Else hitR = True
+                        End If
+                    End If
+                Next lado
+            Next frac
+        End If
+    Next f
+
+    If ROMPER_EN_LOSA_DE_BORDE Then
+        HayLosa = hitL Or hitR
+    Else
+        HayLosa = hitL And hitR
+    End If
+End Function
+
+Private Function PuntoEnPoligono(ByVal px As Double, ByVal py As Double, _
+                                 ByVal xs As Variant, ByVal ys As Variant) As Boolean
+    Dim n As Long, a As Long, b As Long, dentro As Boolean
+    n = UBound(xs) - LBound(xs) + 1
+    b = UBound(xs)
+    For a = LBound(xs) To UBound(xs)
+        If ((ys(a) > py) <> (ys(b) > py)) Then
+            If px < (xs(b) - xs(a)) * (py - ys(a)) / (ys(b) - ys(a)) + xs(a) Then
+                dentro = Not dentro
+            End If
+        End If
+        b = a
+    Next a
+    PuntoEnPoligono = dentro
+End Function
+
+' ===========================================================
+'  AUXILIAR: crear pier (si no existe) y asignarlo a las areas
+' ===========================================================
+Private Sub AsignarPierLabel(ByVal mdl As ETABSv1.cSapModel, _
+                              ByVal pNm As String, _
+                              ByVal areas As String, _
+                              ByRef ret As Long)
+
+    ret = mdl.PierLabel.SetPier(pNm)
+
+    Dim aList() As String
+    aList = Split(areas, ",")
+
+    Dim aa As Long
+    For aa = 0 To UBound(aList)
+        If Len(Trim(aList(aa))) > 0 Then
+            ret = mdl.AreaObj.SetPier(Trim(aList(aa)), pNm)
+        End If
+    Next aa
+End Sub
+
+Private Function MinD(ByVal a As Double, ByVal b As Double) As Double
+    If a < b Then MinD = a Else MinD = b
+End Function
+
+Private Function MaxD(ByVal a As Double, ByVal b As Double) As Double
+    If a > b Then MaxD = a Else MaxD = b
+End Function

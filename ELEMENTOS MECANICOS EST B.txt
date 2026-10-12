@@ -1,0 +1,638 @@
+Option Explicit
+
+Sub ExportarElemMecanicosESTB()
+
+    On Error GoTo ErrHandler
+
+    Const HOJA_DESTINO As String = "ELEM. MECA."
+    Const COLS_X_STORY As Long = 9            ' <-- era 8, ahora 9
+    Const FILA_INI_X   As Long = 6
+    Const FILA_INI_Y   As Long = 207
+
+    Dim combos(0 To 3) As String
+    combos(0) = "1.3 CM + 1.5 CVMAX"
+    combos(1) = "1.4 CARGA MAX"
+    combos(2) = "ENVOL X"
+    combos(3) = "ENVOL Y"
+
+    Dim combosStr As String
+    combosStr = combos(0) & "  |  " & combos(1) & _
+                "  |  " & combos(2) & "  |  " & combos(3)
+
+    ' -------------------------------------------------------
+    '  1. CONECTAR A ETABS
+    ' -------------------------------------------------------
+    Dim myHelper      As ETABSv1.cHelper
+    Dim myETABSObject As ETABSv1.cOAPI
+    Dim mySapModel    As ETABSv1.cSapModel
+    Set myHelper = New ETABSv1.Helper
+    Set myETABSObject = myHelper.GetObject("CSI.ETABS.API.ETABSObject")
+    Set mySapModel = myETABSObject.SapModel
+
+    Dim ret As Long
+    ret = mySapModel.SetPresentUnits(14)   ' kgf-cm
+
+    ' -------------------------------------------------------
+    '  2. STORIES — ordenar, filtrar BASE
+    ' -------------------------------------------------------
+    Dim nStories  As Long
+    Dim sNames()  As String
+    Dim sElev()   As Double
+    Dim sHgt()    As Double
+    Dim sMaster() As Boolean
+    Dim sSimTo()  As String
+    Dim sSplcAb() As Boolean
+    Dim sSplcHt() As Double
+
+    ret = mySapModel.Story.GetStories(nStories, sNames, sElev, sHgt, _
+                                      sMaster, sSimTo, sSplcAb, sSplcHt)
+    If ret <> 0 Then MsgBox "Error GetStories ret=" & ret, vbCritical: GoTo Limpiar
+
+    Dim si As Long, sj As Long, tmpN As String, tmpE As Double
+    For si = 0 To nStories - 1
+        For sj = 0 To nStories - si - 1
+            If sElev(sj) > sElev(sj + 1) Then
+                tmpE = sElev(sj): sElev(sj) = sElev(sj + 1): sElev(sj + 1) = tmpE
+                tmpN = sNames(sj): sNames(sj) = sNames(sj + 1): sNames(sj + 1) = tmpN
+            End If
+        Next sj
+    Next si
+
+    Dim filtNames() As String: ReDim filtNames(0 To nStories)
+    Dim filtElev()  As Double: ReDim filtElev(0 To nStories)
+    Dim nFilt As Long: nFilt = 0
+    Dim sf As Long
+    For sf = 0 To nStories
+        If InStr(1, UCase(sNames(sf)), "BASE") = 0 Then
+            filtNames(nFilt) = sNames(sf)
+            filtElev(nFilt) = sElev(sf)
+            nFilt = nFilt + 1
+        End If
+    Next sf
+
+    If nFilt = 0 Then MsgBox "No hay stories validos.", vbCritical: GoTo Limpiar
+
+    ReDim Preserve filtNames(0 To nFilt - 1)
+    ReDim Preserve filtElev(0 To nFilt - 1)
+    nStories = nFilt
+
+    For si = 0 To nStories - 2
+        For sj = 0 To nStories - si - 2
+            If filtElev(sj) > filtElev(sj + 1) Then
+                tmpE = filtElev(sj): filtElev(sj) = filtElev(sj + 1): filtElev(sj + 1) = tmpE
+                tmpN = filtNames(sj): filtNames(sj) = filtNames(sj + 1): filtNames(sj + 1) = tmpN
+            End If
+        Next sj
+    Next si
+
+    ReDim sNames(0 To nStories - 1)
+    Dim storyElevs() As Double: ReDim storyElevs(0 To nStories - 1)
+    For sf = 0 To nStories - 1
+        sNames(sf) = filtNames(sf)
+        storyElevs(sf) = filtElev(sf)
+    Next sf
+
+    ' -------------------------------------------------------
+    '  3. ACTIVAR COMBINACIONES
+    ' -------------------------------------------------------
+    ret = mySapModel.Results.Setup.DeselectAllCasesAndCombosForOutput()
+    Dim ic As Long, nCombosActivas As Long: nCombosActivas = 0
+    For ic = 0 To 3
+        ret = mySapModel.Results.Setup.SetComboSelectedForOutput(combos(ic), True)
+        If ret = 0 Then nCombosActivas = nCombosActivas + 1
+    Next ic
+    If nCombosActivas = 0 Then MsgBox "Ninguna combinacion encontrada.", vbCritical: GoTo Limpiar
+
+    ' -------------------------------------------------------
+    '  4. PIER FORCES
+    ' -------------------------------------------------------
+    Dim nResults     As Long
+    Dim storeyName() As String
+    Dim pierName()   As String
+    Dim loadCase()   As String
+    Dim location()   As String
+    Dim P()  As Double, V2() As Double, V3() As Double
+    Dim T()  As Double, M2() As Double, M3() As Double
+
+    ret = mySapModel.Results.PierForce(nResults, storeyName, pierName, _
+                                        loadCase, location, P, V2, V3, T, M2, M3)
+    If ret <> 0 Or nResults = 0 Then
+        MsgBox "Error PierForce ret=" & ret, vbCritical: GoTo Limpiar
+    End If
+
+    ' -------------------------------------------------------
+    '  5. DICCIONARIO CRITICOS  clave = "PIER|STORY"
+    ' -------------------------------------------------------
+    Dim dictCrit  As Object: Set dictCrit = CreateObject("Scripting.Dictionary")
+    Dim dictPiers As Object: Set dictPiers = CreateObject("Scripting.Dictionary")
+    Dim pierOrder As Long: pierOrder = 0
+    Dim ir As Long
+
+    For ir = 0 To nResults - 1
+        If InStr(1, UCase(storeyName(ir)), "BASE") > 0 Then GoTo SigR
+
+        Dim clave As String: clave = pierName(ir) & "|" & storeyName(ir)
+        If Not dictPiers.Exists(pierName(ir)) Then
+            dictPiers.Add pierName(ir), pierOrder: pierOrder = pierOrder + 1
+        End If
+
+        Dim rawP  As Double: rawP = P(ir)
+        Dim rawV2 As Double: rawV2 = V2(ir)
+        Dim rawM3 As Double: rawM3 = M3(ir)
+
+        If Not dictCrit.Exists(clave) Then
+            Dim initA(0 To 5) As Variant
+            initA(0) = rawP: initA(1) = loadCase(ir)
+            initA(2) = rawV2: initA(3) = loadCase(ir)
+            initA(4) = rawM3: initA(5) = loadCase(ir)
+            dictCrit.Add clave, initA
+        Else
+            Dim curA As Variant: curA = dictCrit(clave)
+            If Abs(rawP) > Abs(CDbl(curA(0))) Then curA(0) = rawP: curA(1) = loadCase(ir)
+            If Abs(rawV2) > Abs(CDbl(curA(2))) Then curA(2) = rawV2: curA(3) = loadCase(ir)
+            If Abs(rawM3) > Abs(CDbl(curA(4))) Then curA(4) = rawM3: curA(5) = loadCase(ir)
+            dictCrit(clave) = curA
+        End If
+SigR:
+    Next ir
+
+    ' -------------------------------------------------------
+    '  6. MATERIALES + ESPESOR por Pier+Story
+    '
+    '  dictNotes = nota/material  (texto)
+    '  dictThk   = espesor wTh    (Double, cm, mismas unidades
+    '              que el modelo porque SetPresentUnits(14)=kgf-cm)
+    '
+    '  FIX muros divididos: rango [cgBZ-20%h , cgTZ-20%h)
+    '  cgBZ y cgTZ en las mismas unidades que GetCoordCartesian
+    ' -------------------------------------------------------
+    Dim dictNotes As Object: Set dictNotes = CreateObject("Scripting.Dictionary")
+    Dim dictThk   As Object: Set dictThk = CreateObject("Scripting.Dictionary")    ' <-- NUEVO
+
+    On Error Resume Next
+
+    Dim nPierLabels    As Long
+    Dim pierLabelNms() As String
+    ret = mySapModel.PierLabel.GetNameList(nPierLabels, pierLabelNms)
+
+    If Err.Number = 0 And ret = 0 And nPierLabels > 0 Then
+
+        Dim ipl As Long
+        For ipl = 0 To nPierLabels - 1
+            Err.Clear
+
+            Dim nStOut    As Long
+            Dim stNmOut() As String
+            Dim axAng()   As Double
+            Dim nAO()     As Long
+            Dim nLO()     As Long
+            Dim wBot()    As Double
+            Dim tBot()    As Double
+            Dim wTop()    As Double
+            Dim tTop()    As Double
+            Dim matOut()  As String
+            Dim cgBX()    As Double, cgBY() As Double, cgBZ() As Double
+            Dim cgTX()    As Double, cgTY() As Double, cgTZ() As Double
+
+            ret = mySapModel.PierLabel.GetSectionProperties( _
+                      pierLabelNms(ipl), nStOut, stNmOut, axAng, _
+                      nAO, nLO, wBot, tBot, wTop, tTop, matOut, _
+                      cgBX, cgBY, cgBZ, cgTX, cgTY, cgTZ)
+
+            If Err.Number <> 0 Or ret <> 0 Or nStOut = 0 Then GoTo SigPier
+
+            Dim ist As Long
+            For ist = 0 To nStOut - 1
+                If InStr(1, UCase(stNmOut(ist)), "BASE") > 0 Then GoTo SigSt
+
+                Dim claveNota As String
+                claveNota = pierLabelNms(ipl) & "|" & stNmOut(ist)
+                If dictNotes.Exists(claveNota) Then GoTo SigSt
+
+                Dim matBase As String: matBase = Trim(matOut(ist))
+                If Len(matBase) = 0 Then matBase = "-"
+                Dim notaFinal As String: notaFinal = matBase
+                Dim thkFinal  As Double: thkFinal = 0     ' <-- NUEVO: espesor por defecto
+
+                Dim nAreas2      As Long
+                Dim areaNames2() As String
+                Err.Clear
+                ret = mySapModel.AreaObj.GetNameList(nAreas2, areaNames2)
+
+                If Err.Number = 0 And ret = 0 And nAreas2 > 0 Then
+
+                    ' Rango real del pier (fix muros divididos)
+                    Dim pierH  As Double: pierH = cgTZ(ist) - cgBZ(ist)
+                    Dim tolPct As Double: tolPct = pierH * 0.2
+
+                    Dim ia2 As Long
+                    For ia2 = 0 To nAreas2 - 1
+                        Err.Clear
+                        Dim pLbl2 As String: pLbl2 = ""
+                        ret = mySapModel.AreaObj.GetPier(areaNames2(ia2), pLbl2)
+                        If Err.Number <> 0 Or ret <> 0 Then GoTo SigArea2
+                        If UCase(Trim(pLbl2)) <> UCase(Trim(pierLabelNms(ipl))) Then GoTo SigArea2
+
+                        Err.Clear
+                        Dim nPts2    As Long
+                        Dim ptNms2() As String
+                        ret = mySapModel.AreaObj.GetPoints(areaNames2(ia2), nPts2, ptNms2)
+                        If Err.Number <> 0 Or ret <> 0 Or nPts2 = 0 Then GoTo SigArea2
+
+                        Dim minZ2 As Double: minZ2 = 1E+30
+                        Dim ipt2  As Long
+                        For ipt2 = 0 To nPts2 - 1
+                            Dim pxi2 As Double, pyi2 As Double, pzi2 As Double
+                            Err.Clear
+                            ret = mySapModel.PointObj.GetCoordCartesian(ptNms2(ipt2), pxi2, pyi2, pzi2)
+                            If Err.Number = 0 And ret = 0 Then
+                                If pzi2 < minZ2 Then minZ2 = pzi2
+                            End If
+                        Next ipt2
+
+                        ' Rango [cgBZ-20%h , cgTZ-20%h)
+                        If minZ2 < cgBZ(ist) - tolPct Then GoTo SigArea2
+                        If minZ2 >= cgTZ(ist) - tolPct Then GoTo SigArea2
+
+                        Err.Clear
+                        Dim propNm2 As String: propNm2 = ""
+                        ret = mySapModel.AreaObj.GetProperty(areaNames2(ia2), propNm2)
+                        If Err.Number <> 0 Or ret <> 0 Or Len(Trim(propNm2)) = 0 Then
+                            Err.Clear: propNm2 = ""
+                            ret = mySapModel.AreaObj.GetSection(areaNames2(ia2), propNm2)
+                        End If
+                        If Err.Number <> 0 Or Len(Trim(propNm2)) = 0 Then GoTo SigArea2
+
+                        Err.Clear
+                        Dim wPT  As Long, wST As Long
+                        Dim wMP  As String, wTh As Double
+                        Dim wCl  As Long, wNo As String, wGU As String
+                        ret = mySapModel.PropArea.GetWall(propNm2, wPT, wST, wMP, wTh, wCl, wNo, wGU)
+                        If Err.Number = 0 And ret = 0 Then
+                            thkFinal = wTh          ' <-- NUEVO: guardar espesor siempre
+                            If Len(Trim(wNo)) > 0 Then
+                                notaFinal = Trim(wNo)
+                            End If
+                            Exit For
+                        End If
+SigArea2:
+                    Next ia2
+                End If
+
+                dictNotes.Add claveNota, notaFinal
+                dictThk.Add claveNota, thkFinal     ' <-- NUEVO: agregar espesor al dict
+SigSt:
+            Next ist
+SigPier:
+        Next ipl
+    End If
+
+    Err.Clear
+    On Error GoTo ErrHandler
+
+    ' -------------------------------------------------------
+    '  7. SEPARAR Y ORDENAR PIERS  X / Y
+    ' -------------------------------------------------------
+    Dim nPiers As Long: nPiers = dictPiers.count
+    Dim pierAll() As String: ReDim pierAll(0 To nPiers - 1)
+    Dim kvP As Variant
+    For Each kvP In dictPiers.Keys
+        pierAll(CLng(dictPiers(kvP))) = CStr(kvP)
+    Next kvP
+
+    Dim pi As Long, pj As Long, tmpPier As String
+    For pi = 0 To nPiers - 2
+        For pj = 0 To nPiers - pi - 2
+            If PierSortKey(pierAll(pj)) > PierSortKey(pierAll(pj + 1)) Then
+                tmpPier = pierAll(pj): pierAll(pj) = pierAll(pj + 1): pierAll(pj + 1) = tmpPier
+            End If
+        Next pj
+    Next pi
+
+    Dim pierX() As String: ReDim pierX(0 To nPiers - 1)
+    Dim pierY() As String: ReDim pierY(0 To nPiers - 1)
+    Dim nPX As Long: nPX = 0
+    Dim nPY As Long: nPY = 0
+    Dim pp  As Long
+
+    For pp = 0 To nPiers - 1
+        If InStr(1, UCase(pierAll(pp)), "X") > 0 And _
+           InStr(1, UCase(pierAll(pp)), "Y") = 0 Then
+            pierX(nPX) = pierAll(pp): nPX = nPX + 1
+        Else
+            pierY(nPY) = pierAll(pp): nPY = nPY + 1
+        End If
+    Next pp
+
+    If nPX > 0 Then ReDim Preserve pierX(0 To nPX - 1)
+    If nPY > 0 Then ReDim Preserve pierY(0 To nPY - 1)
+
+    ' -------------------------------------------------------
+    '  8. PREPARAR HOJA
+    ' -------------------------------------------------------
+    Dim ws  As Worksheet
+    Dim wb  As Workbook: Set wb = ThisWorkbook
+    Dim shTmp As Worksheet
+    Dim hojaExiste As Boolean: hojaExiste = False
+    For Each shTmp In wb.Sheets
+        If shTmp.Name = HOJA_DESTINO Then hojaExiste = True: Set ws = shTmp: Exit For
+    Next shTmp
+    If Not hojaExiste Then
+        Set ws = wb.Sheets.Add(After:=wb.Sheets(wb.Sheets.count))
+        ws.Name = HOJA_DESTINO
+    End If
+    ws.Cells.Clear
+
+    ' -------------------------------------------------------
+    '  9. CABECERA
+    ' -------------------------------------------------------
+    Dim startCol  As Long: startCol = 2
+    Dim totalCols As Long: totalCols = nStories * COLS_X_STORY
+
+    With ws.Range(ws.Cells(1, startCol), ws.Cells(1, startCol + totalCols - 1))
+        .Merge
+        .Value = "ELEMENTOS MECANICOS CRITICOS — MUROS (PIER FORCES)  |  " & _
+                 "GRUPO B  |  " & Format(Now, "DD/MM/YYYY HH:MM")
+        .Font.Name = "Calibri": .Font.Size = 12: .Font.Bold = True
+        .Font.Color = RGB(31, 56, 100): .Interior.Color = RGB(217, 225, 242)
+        .HorizontalAlignment = xlCenter: .VerticalAlignment = xlCenter: .RowHeight = 22
+    End With
+
+    With ws.Range(ws.Cells(2, startCol), ws.Cells(2, startCol + totalCols - 1))
+        .Merge
+        .Value = "Combos: " & combosStr & _
+                 "   —   Max. abs. Top/Bottom   —   Stories: " & nStories & _
+                 "   —   Muros X: filas 6-206   |   Muros Y: filas 207-407"
+        .Font.Name = "Calibri": .Font.Size = 9: .Font.Italic = True
+        .Font.Color = RGB(80, 80, 80): .HorizontalAlignment = xlCenter
+    End With
+    ws.Rows(3).RowHeight = 5
+
+    ' -------------------------------------------------------
+    '  10. ENCABEZADOS POR STORY
+    ' -------------------------------------------------------
+    Dim storyColors(0 To 5) As Long
+    storyColors(0) = RGB(31, 56, 100): storyColors(1) = RGB(62, 88, 35)
+    storyColors(2) = RGB(131, 60, 12): storyColors(3) = RGB(88, 24, 69)
+    storyColors(4) = RGB(10, 88, 88): storyColors(5) = RGB(80, 80, 80)
+
+    ' <-- NUEVO: agregada columna "Espesor (cm)"
+    Dim subHdrs As Variant
+    subHdrs = Array("Pier", "Combo P", "Pmax (kg)", "Combo V2", "V2max (kg)", _
+                    "Combo M3", "M3max (kg*cm)", "Material", "Espesor (cm)")
+
+    Dim st As Long
+    For st = 0 To nStories - 1
+        Dim colBase As Long: colBase = startCol + st * COLS_X_STORY
+        Dim sColor  As Long: sColor = storyColors(st Mod 6)
+
+        With ws.Range(ws.Cells(4, colBase), ws.Cells(4, colBase + COLS_X_STORY - 1))
+            .Merge
+            .Value = sNames(st) & "  (Z=" & Format(storyElevs(st), "0") & " cm)"
+            .Font.Name = "Calibri": .Font.Size = 11: .Font.Bold = True
+            .Font.Color = RGB(255, 255, 255): .Interior.Color = sColor
+            .HorizontalAlignment = xlCenter: .VerticalAlignment = xlCenter: .RowHeight = 20
+        End With
+
+        Dim sh As Long
+        For sh = 0 To COLS_X_STORY - 1
+            With ws.Cells(5, colBase + sh)
+                .Value = subHdrs(sh)
+                .Font.Name = "Calibri": .Font.Size = 9: .Font.Bold = True
+                .Font.Color = RGB(255, 255, 255): .Interior.Color = sColor
+                .HorizontalAlignment = xlCenter: .VerticalAlignment = xlCenter: .WrapText = True
+            End With
+        Next sh
+        ws.Rows(5).RowHeight = 28
+
+        With ws.Range(ws.Cells(206, colBase), ws.Cells(206, colBase + COLS_X_STORY - 1))
+            .Merge
+            .Value = IIf(st = 0, "MUROS Y", "")
+            .Interior.Color = RGB(50, 50, 50)
+            .Font.Name = "Calibri": .Font.Size = 9: .Font.Bold = True
+            .Font.Color = RGB(255, 220, 0): .HorizontalAlignment = xlCenter: .RowHeight = 14
+        End With
+    Next st
+
+    ' -------------------------------------------------------
+    '  11. DATOS
+    ' -------------------------------------------------------
+    Dim dataRow As Long: dataRow = FILA_INI_X
+    For pp = 0 To nPX - 1
+        If dataRow > 205 Then Exit For
+        Call EscribirFila(ws, sNames, nStories, startCol, COLS_X_STORY, _
+                          pierX(pp), dataRow, pp, dictCrit, dictNotes, dictThk)
+        dataRow = dataRow + 1
+    Next pp
+    Do While dataRow <= 205
+        ws.Rows(dataRow).RowHeight = 15: dataRow = dataRow + 1
+    Loop
+
+    dataRow = FILA_INI_Y
+    For pp = 0 To nPY - 1
+        If dataRow > 407 Then Exit For
+        Call EscribirFila(ws, sNames, nStories, startCol, COLS_X_STORY, _
+                          pierY(pp), dataRow, pp, dictCrit, dictNotes, dictThk)
+        dataRow = dataRow + 1
+    Next pp
+    Dim lastDataRow As Long: lastDataRow = dataRow - 1
+
+    ' -------------------------------------------------------
+    '  12. BORDES Y ANCHOS
+    ' -------------------------------------------------------
+    For st = 0 To nStories - 1
+        Dim cB  As Long: cB = startCol + st * COLS_X_STORY
+        Dim sC  As Long: sC = storyColors(st Mod 6)
+        Dim rng As Range
+        Set rng = ws.Range(ws.Cells(4, cB), ws.Cells(205, cB + COLS_X_STORY - 1))
+        Call AplicarBordes(rng, sC)
+        If lastDataRow >= FILA_INI_Y Then
+            Set rng = ws.Range(ws.Cells(FILA_INI_Y, cB), ws.Cells(lastDataRow, cB + COLS_X_STORY - 1))
+            Call AplicarBordes(rng, sC)
+        End If
+    Next st
+
+    ws.Columns("A").ColumnWidth = 3
+    For st = 0 To nStories - 1
+        Dim cBW As Long: cBW = startCol + st * COLS_X_STORY
+        ws.Columns(cBW).ColumnWidth = 7       ' Pier
+        ws.Columns(cBW + 1).ColumnWidth = 16  ' Combo P
+        ws.Columns(cBW + 2).ColumnWidth = 12  ' Pmax
+        ws.Columns(cBW + 3).ColumnWidth = 16  ' Combo V2
+        ws.Columns(cBW + 4).ColumnWidth = 12  ' V2max
+        ws.Columns(cBW + 5).ColumnWidth = 16  ' Combo M3
+        ws.Columns(cBW + 6).ColumnWidth = 14  ' M3max
+        ws.Columns(cBW + 7).ColumnWidth = 22  ' Material
+        ws.Columns(cBW + 8).ColumnWidth = 12  ' <-- NUEVO: Espesor
+    Next st
+
+    ' -------------------------------------------------------
+    '  13. NOTA PIE + INMOVILIZAR
+    ' -------------------------------------------------------
+    With ws.Range(ws.Cells(409, startCol), ws.Cells(409, startCol + totalCols - 1))
+        .Merge
+        .Value = "Unidades: kg y kg*cm  |  Espesor: cm (kgf-cm)  |  " & _
+                 "Material: Notes > MatProp via PierLabel.GetSectionProperties  |  NTC 2023 Grupo B"
+        .Font.Name = "Calibri": .Font.Size = 8: .Font.Italic = True
+        .Font.Color = RGB(120, 120, 120)
+    End With
+
+    ws.Activate
+    ws.Cells(FILA_INI_X, startCol).Select
+    ActiveWindow.FreezePanes = True
+
+    MsgBox "Exportacion completada." & vbCrLf & vbCrLf & _
+           "Hoja          :  " & HOJA_DESTINO & vbCrLf & _
+           "Stories       :  " & nStories & " (sin BASE)" & vbCrLf & _
+           "Muros X       :  " & nPX & "  (filas 6-205)" & vbCrLf & _
+           "Muros Y       :  " & nPY & "  (filas 207-407)" & vbCrLf & _
+           "Combinaciones :  " & nCombosActivas & " de 4" & vbCrLf & _
+           "Materiales    :  " & dictNotes.count & " (via GetSectionProperties)", vbInformation
+
+Limpiar:
+    Exit Sub
+ErrHandler:
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical
+    Resume Limpiar
+
+End Sub
+
+' ================================================================
+Private Sub EscribirFila(ws As Worksheet, sNames() As String, _
+                          nStories As Long, startCol As Long, _
+                          COLS_X_STORY As Long, thisPier As String, _
+                          dataRow As Long, rowIdx As Long, _
+                          dictCrit As Object, dictNotes As Object, _
+                          dictThk As Object)            ' <-- NUEVO parametro
+
+    Dim bgColor As Long
+    If rowIdx Mod 2 = 0 Then bgColor = RGB(255, 255, 255) Else bgColor = RGB(242, 242, 242)
+
+    Dim st As Long
+    For st = 0 To nStories - 1
+        Dim cBase As Long: cBase = startCol + st * COLS_X_STORY
+        Dim ck    As String: ck = thisPier & "|" & sNames(st)
+
+        Dim notaPier As String: notaPier = ""
+        If dictNotes.Exists(ck) Then notaPier = CStr(dictNotes(ck))
+
+        Dim thkPier As Double: thkPier = 0
+        If dictThk.Exists(ck) Then thkPier = CDbl(dictThk(ck))   ' <-- NUEVO
+
+        With ws.Cells(dataRow, cBase)
+            .Value = thisPier: .Interior.Color = bgColor
+            .Font.Name = "Calibri": .Font.Size = 10: .Font.Bold = True
+            .HorizontalAlignment = xlCenter: .VerticalAlignment = xlCenter
+        End With
+
+        If dictCrit.Exists(ck) Then
+            Dim dArr As Variant: dArr = dictCrit(ck)
+            With ws.Cells(dataRow, cBase + 1)
+                .Value = dArr(1): .Interior.Color = bgColor
+                .Font.Name = "Calibri": .Font.Size = 8: .Font.Italic = True
+                .Font.Color = RGB(60, 60, 60): .HorizontalAlignment = xlCenter: .WrapText = True
+            End With
+            With ws.Cells(dataRow, cBase + 2)
+                .Value = CDbl(dArr(0)): .NumberFormat = "#,##0.00;(#,##0.00);-"
+                .Interior.Color = bgColor: .Font.Name = "Calibri"
+                .Font.Size = 10: .Font.Bold = True: .HorizontalAlignment = xlRight
+            End With
+            With ws.Cells(dataRow, cBase + 3)
+                .Value = dArr(3): .Interior.Color = bgColor
+                .Font.Name = "Calibri": .Font.Size = 8: .Font.Italic = True
+                .Font.Color = RGB(60, 60, 60): .HorizontalAlignment = xlCenter: .WrapText = True
+            End With
+            With ws.Cells(dataRow, cBase + 4)
+                .Value = CDbl(dArr(2)): .NumberFormat = "#,##0.00;(#,##0.00);-"
+                .Interior.Color = bgColor: .Font.Name = "Calibri"
+                .Font.Size = 10: .Font.Bold = True: .HorizontalAlignment = xlRight
+            End With
+            With ws.Cells(dataRow, cBase + 5)
+                .Value = dArr(5): .Interior.Color = bgColor
+                .Font.Name = "Calibri": .Font.Size = 8: .Font.Italic = True
+                .Font.Color = RGB(60, 60, 60): .HorizontalAlignment = xlCenter: .WrapText = True
+            End With
+            With ws.Cells(dataRow, cBase + 6)
+                .Value = CDbl(dArr(4)): .NumberFormat = "#,##0.00;(#,##0.00);-"
+                .Interior.Color = bgColor: .Font.Name = "Calibri"
+                .Font.Size = 10: .Font.Bold = True: .HorizontalAlignment = xlRight
+            End With
+        Else
+            Dim ec As Long
+            For ec = 0 To COLS_X_STORY - 2
+                With ws.Cells(dataRow, cBase + ec)
+                    .Value = IIf(ec = 0, thisPier, "-")
+                    .Interior.Color = RGB(230, 230, 230)
+                    .Font.Name = "Calibri": .Font.Size = 10
+                    .Font.Color = RGB(160, 160, 160): .HorizontalAlignment = xlCenter
+                End With
+            Next ec
+        End If
+
+        ' Columna Material (posicion 7)
+        With ws.Cells(dataRow, cBase + 7)
+            .Value = notaPier: .Interior.Color = bgColor
+            .Font.Name = "Calibri": .Font.Size = 9: .Font.Bold = True
+            .Font.Color = RGB(31, 56, 100)
+            .HorizontalAlignment = xlCenter: .VerticalAlignment = xlCenter: .WrapText = True
+        End With
+
+        ' <-- NUEVO: Columna Espesor (posicion 8)
+        With ws.Cells(dataRow, cBase + 8)
+            If thkPier > 0 Then
+                .Value = thkPier
+                .NumberFormat = "0.00"
+            Else
+                .Value = "-"
+            End If
+            .Interior.Color = bgColor
+            .Font.Name = "Calibri": .Font.Size = 10: .Font.Bold = True
+            .Font.Color = RGB(62, 88, 35)
+            .HorizontalAlignment = xlCenter: .VerticalAlignment = xlCenter
+        End With
+    Next st
+
+    ws.Rows(dataRow).RowHeight = 15
+End Sub
+
+' ================================================================
+Private Sub AplicarBordes(rng As Range, sColor As Long)
+    With rng
+        .Borders(xlEdgeLeft).LineStyle = xlContinuous
+        .Borders(xlEdgeLeft).Weight = xlMedium
+        .Borders(xlEdgeLeft).Color = sColor
+        .Borders(xlEdgeRight).LineStyle = xlContinuous
+        .Borders(xlEdgeRight).Weight = xlMedium
+        .Borders(xlEdgeRight).Color = sColor
+        .Borders(xlEdgeBottom).LineStyle = xlContinuous
+        .Borders(xlEdgeBottom).Weight = xlMedium
+        .Borders(xlEdgeBottom).Color = sColor
+        .Borders(xlInsideHorizontal).LineStyle = xlContinuous
+        .Borders(xlInsideHorizontal).Weight = xlHairline
+        .Borders(xlInsideHorizontal).Color = RGB(210, 210, 210)
+        .Borders(xlInsideVertical).LineStyle = xlContinuous
+        .Borders(xlInsideVertical).Weight = xlHairline
+        .Borders(xlInsideVertical).Color = RGB(210, 210, 210)
+    End With
+End Sub
+
+' ================================================================
+Private Function PierSortKey(pierNm As String) As String
+    Dim eje As String: eje = "Z"
+    Dim numStr As String: numStr = ""
+    Dim ch As Long, c As String
+    Dim nm As String: nm = UCase(Trim(pierNm))
+    For ch = 1 To Len(nm)
+        c = Mid(nm, ch, 1)
+        If c = "X" Then eje = "X": Exit For
+        If c = "Y" Then eje = "Y": Exit For
+        If c >= "0" And c <= "9" Then numStr = numStr & c
+    Next ch
+    If numStr = "" Then numStr = "0"
+    PierSortKey = eje & Format(CLng(numStr), "000")
+End Function
+
+
+
+
+
